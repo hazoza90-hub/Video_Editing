@@ -7,6 +7,7 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_session.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new/statistics.dart';
 import '../../../../core/utils/logger.dart';
+import 'ffmpeg_smart_cut_service.dart';
 
 enum CutterMediaType { video, audio }
 
@@ -45,8 +46,10 @@ class RemoveRange {
 }
 
 class FfmpegMediaCutterService {
-  FfmpegMediaCutterService();
+  FfmpegMediaCutterService({FfmpegSmartCutService? smartCutService})
+    : _smartCutService = smartCutService ?? FfmpegSmartCutService();
 
+  final FfmpegSmartCutService _smartCutService;
   bool _cancelled = false;
   FFmpegSession? _activeSession;
   void Function(double progress)? _progressSink;
@@ -1115,6 +1118,202 @@ class FfmpegMediaCutterService {
     return outputs;
   }
 
+  /// Smart Cut variant of [cut] for keep-selection exports: stream-copies
+  /// interior closed GOPs, re-encodes only partial GOP edges with matched x264
+  /// flags, applies de-click audio fades, verifies the exported file, and falls
+  /// back transparently to [cut] when Smart Cut cannot be used.
+  Future<String?> cutSmart({
+    required String inputPath,
+    required String outputPath,
+    required double startSeconds,
+    required double endSeconds,
+    required double totalDurationSeconds,
+    required CutterMediaType mediaType,
+    bool hasAudio = true,
+    void Function(double progress)? onProgress,
+  }) async {
+    _validateRange(startSeconds, endSeconds);
+    if (mediaType == CutterMediaType.video && totalDurationSeconds > 0) {
+      final result = await _smartCutService.smartCutSegments(
+        inputPath: inputPath,
+        outputPath: outputPath,
+        keptSegments: [(startSeconds, endSeconds)],
+        totalDurationSeconds: totalDurationSeconds,
+        hasAudio: hasAudio,
+        onProgress: onProgress,
+      );
+      if (result.succeeded) return result.outputPath;
+      AppLogger().w(
+        'Media cutter Smart Cut fell back to re-encode '
+        '(${result.fallbackReason?.name}): ${result.message}',
+      );
+    }
+
+    return cut(
+      inputPath: inputPath,
+      outputPath: outputPath,
+      startSeconds: startSeconds,
+      endSeconds: endSeconds,
+      totalDurationSeconds: totalDurationSeconds,
+      mediaType: mediaType,
+      mode: CutterMode.keepSelection,
+      hasAudio: hasAudio,
+      onProgress: onProgress,
+    );
+  }
+
+  /// Smart Cut variant of [cutFastRemove] for single-range removal exports,
+  /// automatically falling back to [cut] on incompatibility or failure.
+  Future<String?> cutSmartRemove({
+    required String inputPath,
+    required String outputPath,
+    required double removeStartSeconds,
+    required double removeEndSeconds,
+    required double totalDurationSeconds,
+    required CutterMediaType mediaType,
+    bool hasAudio = true,
+    void Function(double progress)? onProgress,
+  }) async {
+    _validateRange(removeStartSeconds, removeEndSeconds);
+    if (totalDurationSeconds <= 0) {
+      throw ArgumentError('totalDurationSeconds must be positive');
+    }
+    if (removeStartSeconds <= 0 && removeEndSeconds >= totalDurationSeconds) {
+      throw ArgumentError('Cannot remove the entire media file');
+    }
+    final kept = _keptSegments(
+      [RemoveRange(start: removeStartSeconds, end: removeEndSeconds)],
+      totalDurationSeconds,
+    );
+    if (kept.isEmpty) {
+      throw ArgumentError('Cannot remove the entire media file');
+    }
+
+    if (mediaType == CutterMediaType.video) {
+      final result = await _smartCutService.smartCutSegments(
+        inputPath: inputPath,
+        outputPath: outputPath,
+        keptSegments: kept,
+        totalDurationSeconds: totalDurationSeconds,
+        hasAudio: hasAudio,
+        onProgress: onProgress,
+      );
+      if (result.succeeded) return result.outputPath;
+      AppLogger().w(
+        'Media cutter Smart Cut remove fell back to re-encode '
+        '(${result.fallbackReason?.name}): ${result.message}',
+      );
+    }
+
+    return cut(
+      inputPath: inputPath,
+      outputPath: outputPath,
+      startSeconds: removeStartSeconds,
+      endSeconds: removeEndSeconds,
+      totalDurationSeconds: totalDurationSeconds,
+      mediaType: mediaType,
+      mode: CutterMode.removeSelection,
+      hasAudio: hasAudio,
+      onProgress: onProgress,
+    );
+  }
+
+  /// Smart Cut variant of [cutFastMultiRemove] over multiple [ranges],
+  /// automatically falling back to [cutMultiRemove] on incompatibility or
+  /// verification failure.
+  Future<String?> cutSmartMultiRemove({
+    required String inputPath,
+    required String outputPath,
+    required List<RemoveRange> ranges,
+    required double totalDurationSeconds,
+    required CutterMediaType mediaType,
+    bool hasAudio = true,
+    void Function(double progress)? onProgress,
+  }) async {
+    final kept = _keptSegments(ranges, totalDurationSeconds);
+    if (kept.isEmpty) {
+      throw ArgumentError('Cannot remove the entire media file');
+    }
+
+    if (mediaType == CutterMediaType.video) {
+      final result = await _smartCutService.smartCutSegments(
+        inputPath: inputPath,
+        outputPath: outputPath,
+        keptSegments: kept,
+        totalDurationSeconds: totalDurationSeconds,
+        hasAudio: hasAudio,
+        onProgress: onProgress,
+      );
+      if (result.succeeded) return result.outputPath;
+      AppLogger().w(
+        'Media cutter Smart Cut multi remove fell back to re-encode '
+        '(${result.fallbackReason?.name}): ${result.message}',
+      );
+    }
+
+    return cutMultiRemove(
+      inputPath: inputPath,
+      outputPath: outputPath,
+      ranges: ranges,
+      totalDurationSeconds: totalDurationSeconds,
+      mediaType: mediaType,
+      hasAudio: hasAudio,
+      onProgress: onProgress,
+    );
+  }
+
+  /// Smart Cut variant of [splitAtCuts]: probes the source once, exports each
+  /// cut segment with frame-accurate GOP edges and de-click audio, verifies
+  /// every output, and falls back transparently to [splitAtCuts] (re-encode)
+  /// if any part cannot be Smart Cut.
+  Future<List<String>> splitAtCutsSmart({
+    required String inputPath,
+    required String outputDirectory,
+    required String baseName,
+    required List<double> cutPointsSeconds,
+    required double totalDurationSeconds,
+    required CutterMediaType mediaType,
+    bool hasAudio = true,
+    void Function(double progress)? onProgress,
+  }) async {
+    buildSplitAtCutsCommands(
+      inputPath: inputPath,
+      outputDirectory: outputDirectory,
+      baseName: baseName,
+      cutPointsSeconds: cutPointsSeconds,
+      totalDurationSeconds: totalDurationSeconds,
+      mediaType: mediaType,
+    );
+
+    if (mediaType == CutterMediaType.video) {
+      final result = await _smartCutService.smartSplitAtCuts(
+        inputPath: inputPath,
+        outputDirectory: outputDirectory,
+        baseName: baseName,
+        cutPointsSeconds: cutPointsSeconds,
+        totalDurationSeconds: totalDurationSeconds,
+        hasAudio: hasAudio,
+        onProgress: onProgress,
+      );
+      if (result.succeeded) return result.outputs!;
+      AppLogger().w(
+        'Media cutter Smart Cut split fell back to re-encode '
+        '(${result.fallbackReason?.name}): ${result.message}',
+      );
+    }
+
+    return splitAtCuts(
+      inputPath: inputPath,
+      outputDirectory: outputDirectory,
+      baseName: baseName,
+      cutPointsSeconds: cutPointsSeconds,
+      totalDurationSeconds: totalDurationSeconds,
+      mediaType: mediaType,
+      streamCopy: false,
+      onProgress: onProgress,
+    );
+  }
+
   /// Stops the running export immediately, if any. The pending await in the
   /// service resolves and the export methods throw
   /// [MediaCutterCancelledException].
@@ -1123,6 +1322,7 @@ class FfmpegMediaCutterService {
     // Fire-and-forget: if the session already finished, the cancel request is
     // harmless and the _cancelled flag still reports the cancellation.
     _activeSession?.cancel().ignore();
+    _smartCutService.cancel();
   }
 
   /// Runs a command and resolves when it finishes. Stores the live session so

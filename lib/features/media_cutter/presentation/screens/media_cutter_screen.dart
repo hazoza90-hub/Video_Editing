@@ -12,6 +12,10 @@ import '../../../../core/utils/logger.dart';
 import '../../../audio_processing/data/repositories/audio_processor_repository_impl.dart';
 import '../../../audio_processing/domain/entities/waveform_data.dart';
 import '../../data/services/ffmpeg_media_cutter_service.dart';
+import '../../data/services/ffmpeg_smart_cut_service.dart';
+import '../../data/services/smart_cut_planner.dart';
+
+enum CutterExportMode { smart, fastCopy, precise }
 
 class MediaCutterScreen extends StatefulWidget {
   final String mediaPath;
@@ -52,10 +56,11 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
   String? _previewPath;
   bool _actualHasAudio = true;
   bool _isFastCopyCompatible = false;
+  bool _isSmartCutCompatible = false;
 
-  /// Optional fast export (stream copy, no re-encode). Off by default so the
-  /// precise re-encoding behavior stays the default.
-  bool _fastExport = false;
+  /// Video export mode: defaults to Smart Cut when the probed stream is
+  /// H.264 CFR compatible, otherwise falls back to precise re-encoding.
+  CutterExportMode _exportMode = CutterExportMode.precise;
   final ValueNotifier<double> _exportProgress = ValueNotifier<double>(0);
 
   @override
@@ -112,10 +117,18 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
       }
       final fastCopyCompatible = FfmpegMediaCutterService
           .isFastCopyCompatible(videoCodec: videoCodec, audioCodec: audioCodec);
+      final smartParams = FfmpegSmartCutService.extractVideoParams(info);
+      final smartCutCompatible =
+          smartParams != null &&
+          SmartCutPlanner.canAttemptSmartCut(smartParams);
       if (mounted) {
         setState(() {
           _actualHasAudio = detectedAudio;
           _isFastCopyCompatible = fastCopyCompatible;
+          _isSmartCutCompatible = smartCutCompatible;
+          if (!widget.isAudio && smartCutCompatible) {
+            _exportMode = CutterExportMode.smart;
+          }
         });
       }
 
@@ -290,6 +303,22 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
   /// and every fast path falls back to re-encoding automatically.
   bool get _canUseFastExport => !widget.isAudio && _isFastCopyCompatible;
 
+  bool get _canUseSmartCut => !widget.isAudio && _isSmartCutCompatible;
+
+  bool get _showExportModeSelector =>
+      !widget.isAudio && (_canUseSmartCut || _canUseFastExport);
+
+  CutterExportMode get _effectiveExportMode {
+    if (widget.isAudio) return CutterExportMode.precise;
+    if (_exportMode == CutterExportMode.smart && _canUseSmartCut) {
+      return CutterExportMode.smart;
+    }
+    if (_exportMode == CutterExportMode.fastCopy && _canUseFastExport) {
+      return CutterExportMode.fastCopy;
+    }
+    return CutterExportMode.precise;
+  }
+
   Future<void> _exportCut() async {
     if (_isExporting) return;
     if (VideoDownloadService.isUrl(widget.mediaPath)) {
@@ -320,9 +349,11 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
           .replaceAll(RegExp(r'\.[^.]+$'), '');
       final suffix = _mode == CutterMode.keepSelection ? 'trimmed' : 'cut';
       final ext = widget.isAudio ? 'm4a' : 'mp4';
-      // Read defensively so a stale toggle can never enable stream copy for
+      // Read defensively so a stale mode can never enable copy/smart cut for
       // audio files or incompatible codecs.
-      final fast = _fastExport && _canUseFastExport;
+      final exportMode = _effectiveExportMode;
+      final fast = exportMode == CutterExportMode.fastCopy;
+      final smart = exportMode == CutterExportMode.smart;
 
       if (_mode == CutterMode.splitAudio) {
         if (_cutPoints.isEmpty) {
@@ -343,18 +374,31 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
         );
         await splitDir.create(recursive: true);
         splitOutputDir = splitDir;
-        final outputs = await _service.splitAtCuts(
-          inputPath: widget.mediaPath,
-          outputDirectory: splitDir.path,
-          baseName: baseName,
-          cutPointsSeconds: _cutPoints,
-          totalDurationSeconds: _durationSeconds,
-          mediaType: widget.isAudio
-              ? CutterMediaType.audio
-              : CutterMediaType.video,
-          streamCopy: fast,
-          onProgress: _updateExportProgress,
-        );
+        final outputs = smart
+            ? await _service.splitAtCutsSmart(
+                inputPath: widget.mediaPath,
+                outputDirectory: splitDir.path,
+                baseName: baseName,
+                cutPointsSeconds: _cutPoints,
+                totalDurationSeconds: _durationSeconds,
+                mediaType: widget.isAudio
+                    ? CutterMediaType.audio
+                    : CutterMediaType.video,
+                hasAudio: _actualHasAudio,
+                onProgress: _updateExportProgress,
+              )
+            : await _service.splitAtCuts(
+                inputPath: widget.mediaPath,
+                outputDirectory: splitDir.path,
+                baseName: baseName,
+                cutPointsSeconds: _cutPoints,
+                totalDurationSeconds: _durationSeconds,
+                mediaType: widget.isAudio
+                    ? CutterMediaType.audio
+                    : CutterMediaType.video,
+                streamCopy: fast,
+                onProgress: _updateExportProgress,
+              );
 
         for (final output in outputs) {
           await MediaScanner.scanFile(output);
@@ -377,7 +421,47 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
       singleOutputPath = outputPath;
 
       final String? result;
-      if (fast && _mode == CutterMode.keepSelection) {
+      if (smart && _mode == CutterMode.keepSelection) {
+        result = await _service.cutSmart(
+          inputPath: widget.mediaPath,
+          outputPath: outputPath,
+          startSeconds: _startSeconds,
+          endSeconds: _endSeconds,
+          totalDurationSeconds: _durationSeconds,
+          mediaType: widget.isAudio
+              ? CutterMediaType.audio
+              : CutterMediaType.video,
+          hasAudio: _actualHasAudio,
+          onProgress: _updateExportProgress,
+        );
+      } else if (smart &&
+          _mode == CutterMode.removeSelection &&
+          _removeRanges.isNotEmpty) {
+        result = await _service.cutSmartMultiRemove(
+          inputPath: widget.mediaPath,
+          outputPath: outputPath,
+          ranges: _removeRanges,
+          totalDurationSeconds: _durationSeconds,
+          mediaType: widget.isAudio
+              ? CutterMediaType.audio
+              : CutterMediaType.video,
+          hasAudio: _actualHasAudio,
+          onProgress: _updateExportProgress,
+        );
+      } else if (smart) {
+        result = await _service.cutSmartRemove(
+          inputPath: widget.mediaPath,
+          outputPath: outputPath,
+          removeStartSeconds: _startSeconds,
+          removeEndSeconds: _endSeconds,
+          totalDurationSeconds: _durationSeconds,
+          mediaType: widget.isAudio
+              ? CutterMediaType.audio
+              : CutterMediaType.video,
+          hasAudio: _actualHasAudio,
+          onProgress: _updateExportProgress,
+        );
+      } else if (fast && _mode == CutterMode.keepSelection) {
         result = await _service.cutFast(
           inputPath: widget.mediaPath,
           outputPath: outputPath,
@@ -1295,7 +1379,7 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
                 ],
               );
 
-        if (!_canUseFastExport) return buttons;
+        if (!_showExportModeSelector) return buttons;
 
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1310,29 +1394,130 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
   }
 
   Widget _buildFastExportToggle() {
+    final activeMode = _effectiveExportMode;
+    final subtitle = switch (activeMode) {
+      CutterExportMode.smart =>
+        'Smart Cut — fast stream copy with frame-accurate GOP edges & de-click audio',
+      CutterExportMode.fastCopy =>
+        'Fast Copy — instant keyframe-aligned copy, slightly imprecise',
+      CutterExportMode.precise =>
+        'Precise — full re-encode for frame-accurate output',
+    };
+
     return Container(
+      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: AppColors.surface,
         borderRadius: BorderRadius.circular(12),
         border: Border.all(color: AppColors.cardBorder),
       ),
-      child: SwitchListTile(
-        value: _fastExport,
-        onChanged: _isExporting
-            ? null
-            : (value) => setState(() => _fastExport = value),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 12),
-        title: const Text(
-          'Fast export (no re-encode)',
-          style: TextStyle(
-            color: AppColors.textPrimary,
-            fontSize: 13,
-            fontWeight: FontWeight.w600,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Export mode',
+            style: TextStyle(
+              color: AppColors.textPrimary,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
           ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: _exportModeOption(
+                  label: 'Smart Cut',
+                  icon: Icons.auto_awesome,
+                  selected: activeMode == CutterExportMode.smart,
+                  enabled: _canUseSmartCut && !_isExporting,
+                  onTap: () =>
+                      setState(() => _exportMode = CutterExportMode.smart),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _exportModeOption(
+                  label: 'Fast Copy',
+                  icon: Icons.bolt,
+                  selected: activeMode == CutterExportMode.fastCopy,
+                  enabled: _canUseFastExport && !_isExporting,
+                  onTap: () =>
+                      setState(() => _exportMode = CutterExportMode.fastCopy),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _exportModeOption(
+                  label: 'Precise',
+                  icon: Icons.high_quality,
+                  selected: activeMode == CutterExportMode.precise,
+                  enabled: !_isExporting,
+                  onTap: () =>
+                      setState(() => _exportMode = CutterExportMode.precise),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            subtitle,
+            style: const TextStyle(
+              color: AppColors.textSecondary,
+              fontSize: 11,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _exportModeOption({
+    required String label,
+    required IconData icon,
+    required bool selected,
+    required bool enabled,
+    required VoidCallback onTap,
+  }) {
+    final borderColor = selected
+        ? AppColors.primary
+        : AppColors.cardBorder;
+    final fgColor = !enabled
+        ? AppColors.textTertiary.withValues(alpha: 0.45)
+        : (selected ? AppColors.textPrimary : AppColors.textSecondary);
+    final iconColor = !enabled
+        ? AppColors.textTertiary.withValues(alpha: 0.45)
+        : (selected ? AppColors.primary : AppColors.textTertiary);
+
+    return InkWell(
+      onTap: enabled ? onTap : null,
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+        decoration: BoxDecoration(
+          color: selected
+              ? AppColors.primary.withValues(alpha: 0.14)
+              : AppColors.background,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: borderColor),
         ),
-        subtitle: const Text(
-          'Keyframe-aligned, much faster, slightly imprecise',
-          style: TextStyle(color: AppColors.textSecondary, fontSize: 11),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 17, color: iconColor),
+            const SizedBox(height: 4),
+            Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: fgColor,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
         ),
       ),
     );

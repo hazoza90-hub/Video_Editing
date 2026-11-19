@@ -118,7 +118,7 @@
 
 ### Media Cutter — الفيديو
 
-`media_cutter/presentation/screens/media_cutter_screen.dart` و`FfmpegMediaCutterService`: keep selection، remove selection، split عند نقاط يضعها المستخدم، حذف عدة ranges، waveform ونقاط قص ومعاينات حول مواضع الحذف، اختيار مسار سريع stream-copy أو re-encode/fallback. يدعم فيديو بدون audio. الخدمة تحتوي validation للمدى، توليد أوامر مستقل قابل للاختبار، متابعة session وإلغاء وتنظيف الأجزاء المؤقتة. لا تخلطها مع `FfmpegCuttingService` الخاص بالسكتات؛ الأولى أوسع وأحدث، لكن ليست مثبتة سليمة بكل حالات الوسائط.
+`media_cutter/presentation/screens/media_cutter_screen.dart` و`FfmpegMediaCutterService` و`FfmpegSmartCutService` و`SmartCutPlanner`: keep selection، remove selection، split عند نقاط يضعها المستخدم، حذف عدة ranges، waveform ونقاط قص ومعاينات حول مواضع الحذف، ومنتقي وضع التصدير للفيديو (`CutterExportMode`: `smart` افتراضي لـH.264 CFR، و`fastCopy`، و`precise`). في Smart Cut: التخطيط النقي يحلل حزم الفيديو (`pts_time`/`dts_time`/`flags`)، يرفض Open-GOP/VFR/الكوديكات غير المدعومة، ينسخ الـGOPs الداخلية بـ`-c:v copy` ويعيد ترميز الحواف فقط بوسوم `libx264` مطابقة للمصدر، يطبق `aresample`/`apad` و`afade` `0.005s` (De-click) على نقاط الوصل الداخلية، ينفّذ تحقق FFprobe إلزاميًا بعد التصدير (`validateOutputProbe`)، ويرجع تلقائيًا لإعادة الترميز الكاملة عند عدم التوافق أو الفشل مع تنظيف مجلد المهمة المؤقت في `finally`. يدعم فيديو بدون audio؛ وملفات الصوت تحافظ على سلوكها السابق كما هو. لا تخلطها مع `FfmpegCuttingService` الخاص بالسكتات؛ التحقق الفعلي على وسائط حقيقية/جهاز Android ما زال مطلوبًا.
 
 ### Audio Editor
 
@@ -611,3 +611,18 @@ Android يستخدم Java/Kotlin target 17، SDK versions موروثة من Flut
 - Checks run: flutter analyze --no-pub = No issues found; flutter test --no-pub = 409 passed.
 - Limitations: host-side only - no device run, no real media/ML Kit/FFmpeg; new silhouette constants and ceiling-pillar stripping verified only on synthetic grids; expanded exclusion rect and passersby penalty need on-device validation.
 - Status: Implemented - awaiting review.
+
+### 2026-11-19 — Media Cutter Smart Cut + Post-Export Verification
+
+- Scope: `lib/features/media_cutter/data/services/smart_cut_planner.dart` (new), `lib/features/media_cutter/data/services/ffmpeg_smart_cut_service.dart` (new), `lib/features/media_cutter/data/services/ffmpeg_media_cutter_service.dart`, `lib/features/media_cutter/presentation/screens/media_cutter_screen.dart`, `test/smart_cut_planner_test.dart` (new).
+- Summary:
+  - Added pure Dart `SmartCutPlanner` (`SmartCutVideoParams`, `SmartCutPacket`, `SmartCutPart`, `SmartCutPlan`, `SmartCutFallbackReason`, `SmartCutVerificationResult`): H.264 CFR pre-flight compatibility check, decode-order Open-GOP boundary detection (`isOpenGop`), head-reencode / middle-copy / tail-reencode / EOF-copy planning (`planSegment`), matched `libx264` flag builder (`buildMatchedX264Flags` filtering `unknown`/`unspecified` color tags), internal-splice de-click audio filter builder (`buildAudioDeclickFilter` with `0.005s` `afade`, `aresample=async=1:first_pts=0`, `apad=whole_dur=...`), command/concat builders, and post-export probe validation (`validateOutputProbe` enforcing stream presence, non-zero file size, and duration tolerance `max(0.5s, 3 frames)`).
+  - Added `FfmpegSmartCutService` implementing probe -> plan -> edit -> verify (`FFprobeKit.getMediaInformation`, `FFprobeKit.execute` packet CSV probe, job-scoped temp directory cleaned up in `finally`, cancellation support, mandatory post-export verification, and automatic fallback with partial-output cleanup on incompatibility, Open-GOP, encode error, or verification failure) across `smartCutSegments` and `smartSplitAtCuts`.
+  - Integrated `cutSmart`, `cutSmartRemove`, `cutSmartMultiRemove`, and `splitAtCutsSmart` into `FfmpegMediaCutterService` without altering any existing method signatures or command strings, wiring cancellation to both services and preserving audio-only behavior.
+  - Upgraded `MediaCutterScreen` with `CutterExportMode` (`smart`, `fastCopy`, `precise`) defaulting to `smart` for compatible H.264 CFR video while leaving `widget.isAudio` behavior unchanged.
+- Checks run:
+  - `flutter analyze --no-pub`: 0 errors, 0 issues in created/modified files (only 2 pre-existing unrelated `unused_import` warnings in `lib/features/video_enhancement/presentation/screens/{import_screen,preview_screen}.dart`).
+  - `flutter test --no-pub --reporter compact`: **424 passed** (including all 47 tests in `test/media_cutter_command_test.dart` and 23 new tests in `test/smart_cut_planner_test.dart`).
+- Limitations: host-side unit tests and static analysis only — FFmpeg/FFprobe execution (`FfmpegSmartCutService`) and actual Android device playback/export behavior (GOP stitching, B-frame PTS/DTS alignment, de-click audibility, HEVC/VFR/Open-GOP fallback on real files) have NOT been executed locally yet.
+- Status: Implemented — awaiting review.
+- Next step: Run on-device Android verification across H.264 (with/without B-frames, closed/open GOP), VFR, HEVC, silent video, multi-range remove, and split-at-cuts scenarios, and complete independent review.

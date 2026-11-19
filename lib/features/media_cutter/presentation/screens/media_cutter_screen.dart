@@ -57,6 +57,7 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
   bool _actualHasAudio = true;
   bool _isFastCopyCompatible = false;
   bool _isSmartCutCompatible = false;
+  SmartCutVideoParams? _smartCutParams;
 
   /// Video export mode: defaults to Smart Cut when the probed stream is
   /// H.264 CFR compatible, otherwise falls back to precise re-encoding.
@@ -126,6 +127,7 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
           _actualHasAudio = detectedAudio;
           _isFastCopyCompatible = fastCopyCompatible;
           _isSmartCutCompatible = smartCutCompatible;
+          _smartCutParams = smartParams;
           if (!widget.isAudio && smartCutCompatible) {
             _exportMode = CutterExportMode.smart;
           }
@@ -385,6 +387,7 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
                     ? CutterMediaType.audio
                     : CutterMediaType.video,
                 hasAudio: _actualHasAudio,
+                preProbedParams: _smartCutParams,
                 onProgress: _updateExportProgress,
               )
             : await _service.splitAtCuts(
@@ -432,6 +435,7 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
               ? CutterMediaType.audio
               : CutterMediaType.video,
           hasAudio: _actualHasAudio,
+          preProbedParams: _smartCutParams,
           onProgress: _updateExportProgress,
         );
       } else if (smart &&
@@ -446,6 +450,7 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
               ? CutterMediaType.audio
               : CutterMediaType.video,
           hasAudio: _actualHasAudio,
+          preProbedParams: _smartCutParams,
           onProgress: _updateExportProgress,
         );
       } else if (smart) {
@@ -459,6 +464,7 @@ class _MediaCutterScreenState extends State<MediaCutterScreen> {
               ? CutterMediaType.audio
               : CutterMediaType.video,
           hasAudio: _actualHasAudio,
+          preProbedParams: _smartCutParams,
           onProgress: _updateExportProgress,
         );
       } else if (fast && _mode == CutterMode.keepSelection) {

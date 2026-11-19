@@ -80,6 +80,8 @@ SmartCutVideoParams _validParams({
   String? colorTransfer = 'bt709',
   String? colorRange = 'tv',
   bool isVfr = false,
+  int rotation = 0,
+  double startTimeSeconds = 0.0,
 }) {
   return SmartCutVideoParams(
     codecName: codecName,
@@ -96,6 +98,8 @@ SmartCutVideoParams _validParams({
     colorTransfer: colorTransfer,
     colorRange: colorRange,
     isVfr: isVfr,
+    rotation: rotation,
+    startTimeSeconds: startTimeSeconds,
   );
 }
 
@@ -410,6 +414,75 @@ void main() {
         isTrue,
       );
     });
+
+    test('rejects rotated video, non-zero start_time, and HDR transfers', () {
+      expect(
+        SmartCutPlanner.checkCompatibility(_validParams(rotation: 90)),
+        SmartCutFallbackReason.rotatedSource,
+      );
+      expect(
+        SmartCutPlanner.checkCompatibility(_validParams(rotation: 270)),
+        SmartCutFallbackReason.rotatedSource,
+      );
+      expect(
+        SmartCutPlanner.checkCompatibility(_validParams(rotation: -90)),
+        SmartCutFallbackReason.rotatedSource,
+      );
+      expect(
+        SmartCutPlanner.checkCompatibility(_validParams(rotation: 0)),
+        isNull,
+      );
+      expect(
+        SmartCutPlanner.checkCompatibility(_validParams(rotation: 360)),
+        isNull,
+      );
+
+      expect(
+        SmartCutPlanner.checkCompatibility(_validParams(startTimeSeconds: 0.05)),
+        SmartCutFallbackReason.nonZeroStartTime,
+      );
+      expect(
+        SmartCutPlanner.checkCompatibility(_validParams(startTimeSeconds: -0.02)),
+        SmartCutFallbackReason.nonZeroStartTime,
+      );
+      expect(
+        SmartCutPlanner.checkCompatibility(_validParams(startTimeSeconds: 0.002)),
+        isNull,
+      );
+
+      expect(
+        SmartCutPlanner.checkCompatibility(
+          _validParams(colorTransfer: 'smpte2084'),
+        ),
+        SmartCutFallbackReason.hdrSource,
+      );
+      expect(
+        SmartCutPlanner.checkCompatibility(
+          _validParams(colorTransfer: 'arib-std-b67'),
+        ),
+        SmartCutFallbackReason.hdrSource,
+      );
+    });
+
+    test('extractRotation reads tags rotate and side_data_list rotation', () {
+      expect(
+        SmartCutPlanner.extractRotation(tags: {'rotate': '90'}),
+        90,
+      );
+      expect(
+        SmartCutPlanner.extractRotation(tags: {'ROTATE': '360'}),
+        0,
+      );
+      expect(
+        SmartCutPlanner.extractRotation(
+          sideDataList: [
+            {'side_data_type': 'Display Matrix', 'rotation': -90},
+          ],
+        ),
+        -90,
+      );
+      expect(SmartCutPlanner.extractRotation(), 0);
+    });
   });
 
   group('buildMatchedX264Flags', () {
@@ -448,18 +521,41 @@ void main() {
       expect(flags, isNot(contains('-color_trc')));
       expect(flags, isNot(contains('-color_range')));
     });
+
+    test('normalizes color tags and drops non-whitelisted values', () {
+      final flags = SmartCutPlanner.buildMatchedX264Flags(
+        _validParams(
+          colorSpace: 'GBR',
+          colorTransfer: 'bt470m',
+          colorPrimaries: 'invalid_prim',
+          colorRange: 'bogus',
+        ),
+      );
+      expect(flags, contains('-colorspace rgb'));
+      expect(flags, contains('-color_trc gamma22'));
+      expect(flags, isNot(contains('-color_primaries')));
+      expect(flags, isNot(contains('-color_range')));
+
+      final bgFlags = SmartCutPlanner.buildMatchedX264Flags(
+        _validParams(colorTransfer: 'bt470bg'),
+      );
+      expect(bgFlags, contains('-color_trc gamma28'));
+    });
   });
 
   group('buildAudioDeclickFilter', () {
-    test('single kept segment uses aresample + apad without afade', () {
+    test('single kept segment uses [1:a:0], aresample, apad, and atrim duration without afade', () {
       final filter = SmartCutPlanner.buildAudioDeclickFilter(
         segments: const [(1.5, 5.5)],
       );
 
-      expect(filter, contains('[1:a]atrim=start=1.500000:end=5.500000'));
+      expect(filter, contains('[1:a:0]atrim=start=1.500000:end=5.500000'));
       expect(filter, contains('asetpts=PTS-STARTPTS'));
       expect(filter, contains('aresample=async=1:first_pts=0'));
-      expect(filter, contains('apad=whole_dur=4.000000[outa]'));
+      expect(
+        filter,
+        contains('apad=whole_dur=4.000000,atrim=duration=4.000000[outa]'),
+      );
       expect(filter, isNot(contains('afade=')));
       expect(filter, isNot(contains('concat=')));
     });
@@ -472,17 +568,19 @@ void main() {
       expect(
         filter,
         contains(
-          '[1:a]atrim=start=0.000000:end=2.000000,'
+          '[1:a:0]atrim=start=0.000000:end=2.000000,'
           'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,'
-          'afade=t=out:st=1.995000:d=0.005,apad=whole_dur=2.000000[a0];',
+          'afade=t=out:st=1.995000:d=0.005,'
+          'apad=whole_dur=2.000000,atrim=duration=2.000000[a0];',
         ),
       );
       expect(
         filter,
         contains(
-          '[1:a]atrim=start=4.000000:end=7.000000,'
+          '[1:a:0]atrim=start=4.000000:end=7.000000,'
           'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,'
-          'afade=t=in:st=0:d=0.005,apad=whole_dur=3.000000[a1];',
+          'afade=t=in:st=0:d=0.005,'
+          'apad=whole_dur=3.000000,atrim=duration=3.000000[a1];',
         ),
       );
       expect(filter, endsWith('[a0][a1]concat=n=2:v=0:a=1[outa]'));
@@ -491,17 +589,19 @@ void main() {
     test('three kept segments put both fade-in and fade-out on middle segment', () {
       final filter = SmartCutPlanner.buildAudioDeclickFilter(
         segments: const [(0.0, 1.0), (2.0, 4.0), (5.0, 8.0)],
+        separateInputsPerSegment: true,
       );
 
       expect(
         filter,
         contains(
-          '[1:a]atrim=start=2.000000:end=4.000000,'
+          '[2:a:0]atrim=start=2.000000:end=4.000000,'
           'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,'
           'afade=t=in:st=0:d=0.005,afade=t=out:st=1.995000:d=0.005,'
-          'apad=whole_dur=2.000000[a1];',
+          'apad=whole_dur=2.000000,atrim=duration=2.000000[a1];',
         ),
       );
+      expect(filter, contains('[3:a:0]atrim=start=5.000000:end=8.000000'));
       expect(filter, endsWith('[a0][a1][a2]concat=n=3:v=0:a=1[outa]'));
     });
   });
@@ -514,8 +614,15 @@ void main() {
         expectAudio: true,
         actualDurationSeconds: 4.12,
         expectedDurationSeconds: 4.0,
+        requestedDurationSeconds: 4.0,
         fps: 30.0,
         fileSizeBytes: 102400,
+        outputCodec: 'h264',
+        expectedCodec: 'h264',
+        outputWidth: 1920,
+        outputHeight: 1080,
+        expectedWidth: 1920,
+        expectedHeight: 1080,
       );
       expect(res.isValid, isTrue);
     });
@@ -584,6 +691,52 @@ void main() {
       );
     });
 
+    test('fails on mismatched codec, dimensions, or requested duration drift', () {
+      expect(
+        SmartCutPlanner.validateOutputProbe(
+          hasVideoStream: true,
+          hasAudioStream: true,
+          expectAudio: true,
+          actualDurationSeconds: 4.0,
+          expectedDurationSeconds: 4.0,
+          fps: 30.0,
+          fileSizeBytes: 1024,
+          outputCodec: 'hevc',
+          expectedCodec: 'h264',
+        ).isValid,
+        isFalse,
+      );
+      expect(
+        SmartCutPlanner.validateOutputProbe(
+          hasVideoStream: true,
+          hasAudioStream: true,
+          expectAudio: true,
+          actualDurationSeconds: 4.0,
+          expectedDurationSeconds: 4.0,
+          fps: 30.0,
+          fileSizeBytes: 1024,
+          outputWidth: 1280,
+          outputHeight: 720,
+          expectedWidth: 1920,
+          expectedHeight: 1080,
+        ).isValid,
+        isFalse,
+      );
+      expect(
+        SmartCutPlanner.validateOutputProbe(
+          hasVideoStream: true,
+          hasAudioStream: true,
+          expectAudio: true,
+          actualDurationSeconds: 4.0,
+          expectedDurationSeconds: 4.0,
+          requestedDurationSeconds: 5.0,
+          fps: 30.0,
+          fileSizeBytes: 1024,
+        ).isValid,
+        isFalse,
+      );
+    });
+
     test('uses max(0.5s, 3 frames) tolerance for low-fps streams', () {
       // At 2 fps, 3 frames = 1.5s > 0.5s, so 1.2s drift is allowed and 1.6s fails.
       expect(
@@ -613,8 +766,8 @@ void main() {
     });
   });
 
-  group('CSV parsing & command builders', () {
-    test('parsePacketsCsv preserves decode order and handles N/A fallback', () {
+  group('CSV parsing, part verification, and command builders', () {
+    test('parsePacketsCsv preserves decode order, handles N/A fallback, and enforces maxPackets', () {
       const csv = '''
 0.000000,-0.066667,K_
 0.066667,-0.033333,__
@@ -628,9 +781,121 @@ packet,2.000000,1.933333,K__
       expect(packets[2].pts, closeTo(0.033333, 1e-6));
       expect(packets[2].dts, closeTo(0.033333, 1e-6));
       expect(packets[3].isKeyFrame, isTrue);
+
+      expect(SmartCutPlanner.parsePacketsCsv(csv, maxPackets: 3), isEmpty);
+      expect(SmartCutPlanner.parsePacketsCsv(csv, maxPackets: 4), hasLength(4));
     });
 
-    test('part, concat, and merge command builders format properly', () {
+    test('part verification, landing probe, and A/V offset helpers behave accurately', () {
+      const reencodePart = SmartCutPart(
+        kind: SmartCutPartKind.reencode,
+        start: 2.5,
+        end: 4.0,
+        frameCount: 45,
+      );
+      const boundedCopyPart = SmartCutPart(
+        kind: SmartCutPartKind.copy,
+        start: 4.0,
+        end: 6.0,
+        frameCount: 60,
+        keyDts: 4.0,
+        endDts: 6.0,
+      );
+      const eofCopyPart = SmartCutPart(
+        kind: SmartCutPartKind.copy,
+        start: 4.0,
+        end: 10.0,
+        frameCount: 180,
+        keyDts: 4.0,
+        endDts: null,
+      );
+
+      expect(
+        SmartCutPlanner.validateWrittenPart(
+          part: reencodePart,
+          writtenPacketCount: 45,
+        ),
+        isTrue,
+      );
+      expect(
+        SmartCutPlanner.validateWrittenPart(
+          part: reencodePart,
+          writtenPacketCount: 44,
+        ),
+        isFalse,
+      );
+      expect(
+        SmartCutPlanner.validateWrittenPart(
+          part: boundedCopyPart,
+          writtenPacketCount: 60,
+        ),
+        isTrue,
+      );
+      expect(
+        SmartCutPlanner.validateWrittenPart(
+          part: boundedCopyPart,
+          writtenPacketCount: 59,
+        ),
+        isFalse,
+      );
+      expect(
+        SmartCutPlanner.validateWrittenPart(
+          part: eofCopyPart,
+          writtenPacketCount: 179,
+        ),
+        isTrue,
+      );
+      expect(
+        SmartCutPlanner.validateWrittenPart(
+          part: eofCopyPart,
+          writtenPacketCount: 175,
+        ),
+        isFalse,
+      );
+
+      expect(
+        SmartCutPlanner.parseFirstPacketPts('3.967000,__\n4.000000,K_\n'),
+        closeTo(4.0, 1e-6),
+      );
+      expect(
+        SmartCutPlanner.countCsvPackets('0.000\n0.033\n\npacket,0.066\n'),
+        3,
+      );
+      expect(
+        SmartCutPlanner.isValidCopyLanding(
+          landingPts: 4.001,
+          expectedStartPts: 4.0,
+          fps: 30.0,
+        ),
+        isTrue,
+      );
+      expect(
+        SmartCutPlanner.isValidCopyLanding(
+          landingPts: 2.0,
+          expectedStartPts: 4.0,
+          fps: 30.0,
+        ),
+        isFalse,
+      );
+      expect(
+        SmartCutPlanner.hasExcessiveAvOffset(
+          requestedStart: 2.0,
+          actualStart: 2.02,
+          fps: 30.0,
+        ),
+        isFalse,
+      );
+      expect(
+        SmartCutPlanner.hasExcessiveAvOffset(
+          requestedStart: 2.0,
+          actualStart: 2.10,
+          fps: 30.0,
+        ),
+        isTrue,
+      );
+    });
+
+    test('part, concat, and merge command builders use MPEG-TS, trim, avc1, timescale, and per-segment audio', () {
       final params = _validParams();
       const reencodePart = SmartCutPart(
         kind: SmartCutPartKind.reencode,
@@ -649,41 +914,60 @@ packet,2.000000,1.933333,K__
 
       final reCmd = SmartCutPlanner.buildReencodePartCommand(
         inputPath: 'C:/clips/src.mp4',
-        outputPath: 'C:/tmp/part0.mp4',
+        outputPath: 'C:/tmp/part0.ts',
         part: reencodePart,
         params: params,
       );
-      expect(reCmd, contains('-ss 2.499000'));
+      expect(reCmd, contains('-ss 0.500000'));
+      expect(
+        reCmd,
+        contains(
+          '-vf "trim=start=1.999000:end=3.499000,setpts=PTS-STARTPTS"',
+        ),
+      );
+      expect(reCmd, contains('-fps_mode passthrough'));
       expect(reCmd, contains('-frames:v 45'));
-      expect(reCmd, contains('-video_track_timescale 90000'));
-      expect(reCmd, contains('-an'));
+      expect(reCmd, contains('-sn -dn'));
+      expect(reCmd, contains('-f mpegts'));
+      expect(reCmd, isNot(contains('-video_track_timescale')));
 
       final cpCmd = SmartCutPlanner.buildCopyPartCommand(
         inputPath: 'C:/clips/src.mp4',
-        outputPath: 'C:/tmp/part1.mp4',
+        outputPath: 'C:/tmp/part1.ts',
         part: copyPart,
         params: params,
       );
       expect(cpCmd, contains('-ss 4.001000'));
       expect(cpCmd, contains('-c:v copy'));
       expect(cpCmd, contains('-frames:v 60'));
+      expect(cpCmd, contains('-sn -dn'));
+      expect(cpCmd, contains('-f mpegts'));
 
       final concat = SmartCutPlanner.buildConcatListContent([
-        (path: 'C:/tmp/part0.mp4', duration: 1.5),
-        (path: 'C:/tmp/part1.mp4', duration: 2.0),
+        (path: 'C:/tmp/part0.ts', duration: 1.5),
+        (path: 'C:/tmp/part1.ts', duration: 2.0),
       ]);
       expect(concat, startsWith('ffconcat version 1.0'));
-      expect(concat, contains("file 'C:/tmp/part0.mp4'"));
+      expect(concat, contains("file 'C:/tmp/part0.ts'"));
       expect(concat, contains('duration 1.500000'));
 
       final merge = SmartCutPlanner.buildMergeCommand(
         concatListPath: 'C:/tmp/concat.txt',
         sourceInputPath: 'C:/clips/src.mp4',
         outputPath: 'C:/clips/out.mp4',
-        keptSegments: const [(2.5, 6.0)],
+        keptSegments: const [(2.5, 6.0), (10.0, 12.0)],
         hasAudio: true,
+        videoParams: params,
       );
+      expect(merge, contains('-ss 2.000000 -t 4.500000 -i "C:/clips/src.mp4"'));
+      expect(merge, contains('-ss 9.500000 -t 3.000000 -i "C:/clips/src.mp4"'));
+      expect(merge, contains('[1:a:0]atrim=start=0.500000:end=4.000000'));
+      expect(merge, contains('[2:a:0]atrim=start=0.500000:end=2.500000'));
+      expect(merge, contains('atrim=duration=3.500000'));
       expect(merge, contains('-c:v copy'));
+      expect(merge, contains('-tag:v avc1'));
+      expect(merge, contains('-video_track_timescale 90000'));
+      expect(merge, contains('-sn -dn'));
       expect(merge, contains('-c:a aac -b:a 192k'));
       expect(merge, contains('-movflags +faststart'));
       expect(merge, contains('-map 0:v:0 -map "[outa]"'));

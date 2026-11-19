@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
 
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_session.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
+import 'package:ffmpeg_kit_flutter_new/ffprobe_session.dart';
 import 'package:ffmpeg_kit_flutter_new/media_information.dart';
+import 'package:ffmpeg_kit_flutter_new/media_information_session.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new/stream_information.dart';
 import 'package:path_provider/path_provider.dart';
@@ -60,7 +63,7 @@ class SmartCutSplitResult {
 
 /// Executes GOP-aware Smart Cut (probe -> plan -> edit -> verify) using
 /// FFprobeKit and FFmpegKit, automatically falling back with full temp cleanup
-/// when any compatibility, GOP, encode, or post-export check fails.
+/// when any compatibility, GOP, part, encode, or post-export check fails.
 class FfmpegSmartCutService {
   FfmpegSmartCutService();
 
@@ -68,12 +71,16 @@ class FfmpegSmartCutService {
 
   bool _cancelled = false;
   FFmpegSession? _activeSession;
+  FFprobeSession? _activeProbeSession;
+  MediaInformationSession? _activeMediaInfoSession;
 
-  /// Stops any active FFmpeg session immediately and marks the current export
-  /// cancelled so callers throw [MediaCutterCancelledException].
+  /// Stops any active FFmpeg/FFprobe session immediately and marks the current
+  /// export cancelled so callers throw [MediaCutterCancelledException].
   void cancel() {
     _cancelled = true;
     _activeSession?.cancel().ignore();
+    _activeProbeSession?.cancel().ignore();
+    _activeMediaInfoSession?.cancel().ignore();
   }
 
   /// Extracts [SmartCutVideoParams] from an already-probed [MediaInformation]
@@ -100,6 +107,25 @@ class FfmpegSmartCutService {
       rFrameRate: rFrameRate,
     );
 
+    final rawSideData = videoStream.getProperty('side_data_list');
+    final rotation = SmartCutPlanner.extractRotation(
+      tags: videoStream.getTags(),
+      sideDataList: rawSideData is List ? rawSideData : null,
+    );
+
+    final videoStart = _parseSignedDouble(
+      _readStringProp(videoStream, 'start_time'),
+    );
+    final containerStart = _parseSignedDouble(info.getStartTime());
+    final double startTimeSeconds;
+    if (videoStart != null && containerStart != null) {
+      startTimeSeconds = videoStart.abs() >= containerStart.abs()
+          ? videoStart
+          : containerStart;
+    } else {
+      startTimeSeconds = videoStart ?? containerStart ?? 0.0;
+    }
+
     return SmartCutVideoParams(
       codecName: codecName,
       profile: _readStringProp(videoStream, 'profile'),
@@ -115,15 +141,19 @@ class FfmpegSmartCutService {
       colorTransfer: _readStringProp(videoStream, 'color_transfer'),
       colorRange: _readStringProp(videoStream, 'color_range'),
       isVfr: isVfr,
+      rotation: rotation,
+      startTimeSeconds: startTimeSeconds,
     );
   }
 
-  /// Probes container and stream properties for [inputPath]. Returns `null` on
-  /// failure without throwing.
+  /// Probes container and stream properties asynchronously for [inputPath].
+  /// Returns `null` on failure without throwing; rethrows cancellation.
   Future<SmartCutVideoParams?> probeVideoParams(String inputPath) async {
     try {
-      final session = await FFprobeKit.getMediaInformation(inputPath);
+      final session = await _runMediaInfo(inputPath);
       return extractVideoParams(session.getMediaInformation());
+    } on MediaCutterCancelledException {
+      rethrow;
     } catch (e, stack) {
       AppLogger().e('SmartCut probeVideoParams failed for $inputPath', e, stack);
       return null;
@@ -131,13 +161,14 @@ class FfmpegSmartCutService {
   }
 
   /// Probes video packets (`pts_time`, `dts_time`, `flags`) in demuxer decode
-  /// order. Returns `null` if FFprobe fails or produces no readable packets.
+  /// order using async FFprobe and parses CSV in a background isolate.
+  /// Returns `null` on failure, oversized output, or cancellation-safe abort.
   Future<List<SmartCutPacket>?> probeVideoPackets(String inputPath) async {
     try {
       final command =
           '-v error -select_streams v:0 -show_entries '
           'packet=pts_time,dts_time,flags -of csv=p=0 ${_q(inputPath)}';
-      final session = await FFprobeKit.execute(command);
+      final session = await _runFfprobe(command);
       final rc = await session.getReturnCode();
       if (!ReturnCode.isSuccess(rc)) {
         final logs = await session.getAllLogsAsString();
@@ -145,14 +176,31 @@ class FfmpegSmartCutService {
         return null;
       }
       final output = await session.getOutput();
+      if (_cancelled) throw const MediaCutterCancelledException();
       if (output == null || output.trim().isEmpty) {
         return null;
       }
-      final packets = SmartCutPlanner.parsePacketsCsv(output);
+      if (output.length > SmartCutPlanner.maxProbeCsvBytes) {
+        AppLogger().w(
+          'SmartCut packet probe CSV exceeded ${SmartCutPlanner.maxProbeCsvBytes} '
+          'bytes (${output.length}); falling back cleanly',
+        );
+        return null;
+      }
+
+      final packets = await Isolate.run(
+        () => SmartCutPlanner.parsePacketsCsv(
+          output,
+          maxPackets: SmartCutPlanner.maxProbePackets,
+        ),
+      );
+      if (_cancelled) throw const MediaCutterCancelledException();
       if (packets.isEmpty) {
         return null;
       }
       return packets;
+    } on MediaCutterCancelledException {
+      rethrow;
     } catch (e, stack) {
       AppLogger().e('SmartCut probeVideoPackets failed for $inputPath', e, stack);
       return null;
@@ -160,11 +208,12 @@ class FfmpegSmartCutService {
   }
 
   /// Mandatory post-export probe verification: checks file existence, positive
-  /// size, valid video stream, audio presence when expected, and output
-  /// duration within `max(0.5s, 3 frames)`.
+  /// size, valid video stream, codec/dimensions match, audio presence when
+  /// expected, and duration within `max(0.5s, 3 frames)`.
   Future<SmartCutVerificationResult> verifyOutput({
     required String outputPath,
     required double expectedDurationSeconds,
+    double? requestedDurationSeconds,
     required bool hasAudio,
     required SmartCutVideoParams params,
   }) async {
@@ -182,7 +231,7 @@ class FfmpegSmartCutService {
         );
       }
 
-      final session = await FFprobeKit.getMediaInformation(outputPath);
+      final session = await _runMediaInfo(outputPath);
       final info = session.getMediaInformation();
       if (info == null) {
         return const SmartCutVerificationResult.invalid(
@@ -213,9 +262,18 @@ class FfmpegSmartCutService {
         expectAudio: hasAudio,
         actualDurationSeconds: actualDuration,
         expectedDurationSeconds: expectedDurationSeconds,
+        requestedDurationSeconds: requestedDurationSeconds,
         fps: params.fps,
         fileSizeBytes: fileSize,
+        outputCodec: videoStream?.getCodec(),
+        expectedCodec: params.codecName,
+        outputWidth: videoStream?.getWidth(),
+        outputHeight: videoStream?.getHeight(),
+        expectedWidth: params.width,
+        expectedHeight: params.height,
       );
+    } on MediaCutterCancelledException {
+      rethrow;
     } catch (e, stack) {
       AppLogger().e('SmartCut output verification threw', e, stack);
       return SmartCutVerificationResult.invalid('Verification probe error: $e');
@@ -224,8 +282,8 @@ class FfmpegSmartCutService {
 
   /// Executes Smart Cut for one or more kept `(start, end)` intervals in
   /// [keptSegments]. Returns [SmartCutResult.fallback] on incompatibility,
-  /// Open-GOP boundaries, FFmpeg error, or verification failure; rethrows
-  /// [MediaCutterCancelledException] if cancelled.
+  /// Open-GOP boundaries, part verification mismatch, FFmpeg error, or
+  /// post-export failure; rethrows [MediaCutterCancelledException] if cancelled.
   Future<SmartCutResult> smartCutSegments({
     required String inputPath,
     required String outputPath,
@@ -258,6 +316,7 @@ class FfmpegSmartCutService {
     required List<double> cutPointsSeconds,
     required double totalDurationSeconds,
     required bool hasAudio,
+    SmartCutVideoParams? preProbedParams,
     void Function(double progress)? onProgress,
   }) async {
     _cancelled = false;
@@ -281,7 +340,7 @@ class FfmpegSmartCutService {
       for (var i = 0; i < points.length - 1; i++) (points[i], points[i + 1]),
     ];
 
-    final params = await probeVideoParams(inputPath);
+    final params = preProbedParams ?? await probeVideoParams(inputPath);
     if (_cancelled) throw const MediaCutterCancelledException();
     if (params == null) {
       return _logAndReturnSplitFallback(
@@ -295,6 +354,14 @@ class FfmpegSmartCutService {
       return _logAndReturnSplitFallback(
         compatFailure,
         'Source video is not compatible with Smart Cut',
+      );
+    }
+
+    if (totalDurationSeconds > SmartCutPlanner.maxSmartCutDurationSeconds ||
+        (totalDurationSeconds * params.fps) > SmartCutPlanner.maxProbePackets) {
+      return _logAndReturnSplitFallback(
+        SmartCutFallbackReason.missingPackets,
+        'Video exceeds Smart Cut packet index safety limit',
       );
     }
 
@@ -320,6 +387,17 @@ class FfmpegSmartCutService {
         return _logAndReturnSplitFallback(
           plan.fallbackReason ?? SmartCutFallbackReason.missingPackets,
           'Segment planning declined [${range.$1}, ${range.$2})',
+        );
+      }
+      if (hasAudio &&
+          SmartCutPlanner.hasExcessiveAvOffset(
+            requestedStart: range.$1,
+            actualStart: plan.actualStart,
+            fps: params.fps,
+          )) {
+        return _logAndReturnSplitFallback(
+          SmartCutFallbackReason.verificationFailed,
+          'Excessive A/V start offset for [${range.$1}, ${range.$2})',
         );
       }
       plans.add(plan);
@@ -411,6 +489,16 @@ class FfmpegSmartCutService {
         );
       }
 
+      if (preProbedPackets == null &&
+          (totalDurationSeconds > SmartCutPlanner.maxSmartCutDurationSeconds ||
+              (totalDurationSeconds * params.fps) >
+                  SmartCutPlanner.maxProbePackets)) {
+        return _logAndReturnFallback(
+          SmartCutFallbackReason.missingPackets,
+          'Video exceeds Smart Cut packet index safety limit',
+        );
+      }
+
       final packets = preProbedPackets ?? await probeVideoPackets(inputPath);
       if (_cancelled) throw const MediaCutterCancelledException();
       if (packets == null || packets.isEmpty) {
@@ -440,6 +528,22 @@ class FfmpegSmartCutService {
         }
       }
 
+      if (hasAudio && plans.length == keptSegments.length) {
+        for (var idx = 0; idx < plans.length; idx++) {
+          if (SmartCutPlanner.hasExcessiveAvOffset(
+            requestedStart: keptSegments[idx].$1,
+            actualStart: plans[idx].actualStart,
+            fps: params.fps,
+          )) {
+            return _logAndReturnFallback(
+              SmartCutFallbackReason.verificationFailed,
+              'Excessive A/V start offset: requested=${keptSegments[idx].$1}, '
+              'actual=${plans[idx].actualStart}',
+            );
+          }
+        }
+      }
+
       onProgress?.call(0.05);
 
       final allParts = <SmartCutPart>[
@@ -462,8 +566,26 @@ class FfmpegSmartCutService {
       for (var i = 0; i < allParts.length; i++) {
         if (_cancelled) throw const MediaCutterCancelledException();
         final part = allParts[i];
+
+        if (part.kind == SmartCutPartKind.copy && part.start > 0.0005) {
+          final seekStart = SmartCutPlanner.computeCopySeekStart(part, params);
+          final landingPts = await _probeCopyLandingPts(inputPath, seekStart);
+          if (_cancelled) throw const MediaCutterCancelledException();
+          if (!SmartCutPlanner.isValidCopyLanding(
+            landingPts: landingPts,
+            expectedStartPts: part.start,
+            fps: params.fps,
+          )) {
+            return _logAndReturnFallback(
+              SmartCutFallbackReason.verificationFailed,
+              'Copy part ${i + 1} seek landed at PTS=$landingPts '
+              'instead of expected=${part.start}',
+            );
+          }
+        }
+
         final partPath =
-            '${jobDir.path}/part_${i.toString().padLeft(4, '0')}.mp4';
+            '${jobDir.path}/part_${i.toString().padLeft(4, '0')}.ts';
         final cmd = part.kind == SmartCutPartKind.reencode
             ? SmartCutPlanner.buildReencodePartCommand(
                 inputPath: inputPath,
@@ -517,6 +639,19 @@ class FfmpegSmartCutService {
           );
         }
 
+        final writtenCount = await _countWrittenPartPackets(partPath);
+        if (_cancelled) throw const MediaCutterCancelledException();
+        if (!SmartCutPlanner.validateWrittenPart(
+          part: part,
+          writtenPacketCount: writtenCount,
+        )) {
+          return _logAndReturnFallback(
+            SmartCutFallbackReason.verificationFailed,
+            'Part ${i + 1} (${part.kind.name}) packet count mismatch: '
+            'written=$writtenCount, expected=${part.frameCount}',
+          );
+        }
+
         concatEntries.add((path: partPath, duration: part.duration));
         completedDuration += part.duration;
         onProgress?.call(
@@ -546,12 +681,17 @@ class FfmpegSmartCutService {
         outputPath: outputPath,
         keptSegments: audioSegments,
         hasAudio: hasAudio,
+        videoParams: params,
       );
       AppLogger().i('SmartCut merge command: $mergeCmd');
 
       final expectedDuration = plans.fold<double>(
         0.0,
         (sum, plan) => sum + plan.expectedDuration,
+      );
+      final requestedDuration = keptSegments.fold<double>(
+        0.0,
+        (sum, seg) => sum + (seg.$2 - seg.$1),
       );
       final expectedMs = math.max(1.0, expectedDuration * 1000.0);
 
@@ -584,6 +724,7 @@ class FfmpegSmartCutService {
       final verification = await verifyOutput(
         outputPath: outputPath,
         expectedDurationSeconds: expectedDuration,
+        requestedDurationSeconds: requestedDuration,
         hasAudio: hasAudio,
         params: params,
       );
@@ -616,15 +757,44 @@ class FfmpegSmartCutService {
     }
   }
 
+  Future<double?> _probeCopyLandingPts(
+    String inputPath,
+    double seekStart,
+  ) async {
+    final cmd =
+        '-v error -select_streams v:0 '
+        '-read_intervals ${_fmt6(seekStart)}%+#5 '
+        '-show_entries packet=pts_time,flags -of csv=p=0 ${_q(inputPath)}';
+    final session = await _runFfprobe(cmd);
+    final rc = await session.getReturnCode();
+    if (!ReturnCode.isSuccess(rc)) return null;
+    final output = await session.getOutput();
+    if (output == null || output.trim().isEmpty) return null;
+    return SmartCutPlanner.parseFirstPacketPts(output);
+  }
+
+  Future<int> _countWrittenPartPackets(String partPath) async {
+    final cmd =
+        '-v error -select_streams v:0 '
+        '-show_entries packet=pts_time -of csv=p=0 ${_q(partPath)}';
+    final session = await _runFfprobe(cmd);
+    final rc = await session.getReturnCode();
+    if (!ReturnCode.isSuccess(rc)) return -1;
+    final output = await session.getOutput();
+    if (output == null || output.trim().isEmpty) return 0;
+    return SmartCutPlanner.countCsvPackets(output);
+  }
+
   Future<FFmpegSession> _runFfmpeg(
     String command, {
     void Function(double timeMs)? onTimeMs,
   }) async {
-    final completer = Completer<void>();
+    if (_cancelled) throw const MediaCutterCancelledException();
+    final completer = Completer<FFmpegSession>();
     final session = await FFmpegKit.executeAsync(
       command,
-      (s) {
-        if (!completer.isCompleted) completer.complete();
+      (completed) {
+        if (!completer.isCompleted) completer.complete(completed);
       },
       (log) {},
       (statistics) {
@@ -637,9 +807,45 @@ class FfmpegSmartCutService {
     );
     _activeSession = session;
     if (_cancelled) session.cancel().ignore();
-    await completer.future;
+    final completed = await completer.future;
     _activeSession = null;
-    return session;
+    if (_cancelled) throw const MediaCutterCancelledException();
+    return completed;
+  }
+
+  Future<FFprobeSession> _runFfprobe(String command) async {
+    if (_cancelled) throw const MediaCutterCancelledException();
+    final completer = Completer<FFprobeSession>();
+    final session = await FFprobeKit.executeAsync(
+      command,
+      (completed) {
+        if (!completer.isCompleted) completer.complete(completed);
+      },
+      (log) {},
+    );
+    _activeProbeSession = session;
+    if (_cancelled) session.cancel().ignore();
+    final completed = await completer.future;
+    _activeProbeSession = null;
+    if (_cancelled) throw const MediaCutterCancelledException();
+    return completed;
+  }
+
+  Future<MediaInformationSession> _runMediaInfo(String path) async {
+    if (_cancelled) throw const MediaCutterCancelledException();
+    final completer = Completer<MediaInformationSession>();
+    final session = await FFprobeKit.getMediaInformationAsync(
+      path,
+      (completed) {
+        if (!completer.isCompleted) completer.complete(completed);
+      },
+    );
+    _activeMediaInfoSession = session;
+    if (_cancelled) session.cancel().ignore();
+    final completed = await completer.future;
+    _activeMediaInfoSession = null;
+    if (_cancelled) throw const MediaCutterCancelledException();
+    return completed;
   }
 
   SmartCutResult _logAndReturnFallback(
@@ -681,6 +887,17 @@ class FfmpegSmartCutService {
     if (parsed == null || !parsed.isFinite || parsed <= 0.0) return null;
     return parsed;
   }
+
+  static double? _parseSignedDouble(String? raw) {
+    if (raw == null) return null;
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty || trimmed.toUpperCase() == 'N/A') return null;
+    final parsed = double.tryParse(trimmed);
+    if (parsed == null || !parsed.isFinite) return null;
+    return parsed;
+  }
+
+  static String _fmt6(double seconds) => seconds.toStringAsFixed(6);
 
   static String _q(String path) => '"${path.replaceAll('\\', '/')}"';
 

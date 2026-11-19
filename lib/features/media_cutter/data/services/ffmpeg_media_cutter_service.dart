@@ -8,6 +8,7 @@ import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:ffmpeg_kit_flutter_new/statistics.dart';
 import '../../../../core/utils/logger.dart';
 import 'ffmpeg_smart_cut_service.dart';
+import 'smart_cut_planner.dart';
 
 enum CutterMediaType { video, audio }
 
@@ -559,6 +560,32 @@ class FfmpegMediaCutterService {
     bool hasAudio = true,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
+    return _cutInternal(
+      inputPath: inputPath,
+      outputPath: outputPath,
+      startSeconds: startSeconds,
+      endSeconds: endSeconds,
+      totalDurationSeconds: totalDurationSeconds,
+      mediaType: mediaType,
+      mode: mode,
+      hasAudio: hasAudio,
+      onProgress: onProgress,
+    );
+  }
+
+  Future<String?> _cutInternal({
+    required String inputPath,
+    required String outputPath,
+    required double startSeconds,
+    required double endSeconds,
+    required double totalDurationSeconds,
+    required CutterMediaType mediaType,
+    required CutterMode mode,
+    bool hasAudio = true,
+    void Function(double progress)? onProgress,
+  }) async {
+    if (_cancelled) throw const MediaCutterCancelledException();
     final command = mode == CutterMode.keepSelection
         ? buildTrimCommand(
             inputPath: inputPath,
@@ -614,6 +641,7 @@ class FfmpegMediaCutterService {
     required CutterMediaType mediaType,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
     final command = buildTrimCommand(
       inputPath: inputPath,
       outputPath: outputPath,
@@ -650,8 +678,9 @@ class FfmpegMediaCutterService {
       _disableProgressReporting(onProgress);
     }
     if (fastResult != null) return fastResult;
+    if (_cancelled) throw const MediaCutterCancelledException();
 
-    return cut(
+    return _cutInternal(
       inputPath: inputPath,
       outputPath: outputPath,
       startSeconds: startSeconds,
@@ -682,6 +711,7 @@ class FfmpegMediaCutterService {
     bool hasAudio = true,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
     final commands = buildFastRemoveCommands(
       inputPath: inputPath,
       outputPath: outputPath,
@@ -724,7 +754,8 @@ class FfmpegMediaCutterService {
     }
 
     if (!copySucceeded) {
-      return cut(
+      if (_cancelled) throw const MediaCutterCancelledException();
+      return _cutInternal(
         inputPath: inputPath,
         outputPath: outputPath,
         startSeconds: removeStartSeconds,
@@ -751,6 +782,28 @@ class FfmpegMediaCutterService {
     bool hasAudio = true,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
+    return _cutMultiRemoveInternal(
+      inputPath: inputPath,
+      outputPath: outputPath,
+      ranges: ranges,
+      totalDurationSeconds: totalDurationSeconds,
+      mediaType: mediaType,
+      hasAudio: hasAudio,
+      onProgress: onProgress,
+    );
+  }
+
+  Future<String?> _cutMultiRemoveInternal({
+    required String inputPath,
+    required String outputPath,
+    required List<RemoveRange> ranges,
+    required double totalDurationSeconds,
+    required CutterMediaType mediaType,
+    bool hasAudio = true,
+    void Function(double progress)? onProgress,
+  }) async {
+    if (_cancelled) throw const MediaCutterCancelledException();
     final command = buildMultiRemoveCommand(
       inputPath: inputPath,
       outputPath: outputPath,
@@ -802,6 +855,7 @@ class FfmpegMediaCutterService {
     bool hasAudio = true,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
     final commands = buildFastMultiRemoveCommands(
       inputPath: inputPath,
       outputPath: outputPath,
@@ -843,7 +897,8 @@ class FfmpegMediaCutterService {
     }
 
     if (!copySucceeded) {
-      return cutMultiRemove(
+      if (_cancelled) throw const MediaCutterCancelledException();
+      return _cutMultiRemoveInternal(
         inputPath: inputPath,
         outputPath: outputPath,
         ranges: ranges,
@@ -869,6 +924,7 @@ class FfmpegMediaCutterService {
     bool hasAudio = true,
     double windowSeconds = 5,
   }) async {
+    _cancelled = false;
     final command = buildRemovePreviewCommand(
       inputPath: inputPath,
       outputPath: outputPath,
@@ -904,6 +960,7 @@ class FfmpegMediaCutterService {
     bool hasAudio = true,
     double windowSeconds = 5,
   }) async {
+    _cancelled = false;
     final command = buildMultiRemovePreviewCommand(
       inputPath: inputPath,
       outputPath: outputPath,
@@ -1024,6 +1081,7 @@ class FfmpegMediaCutterService {
     required double totalDurationSeconds,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
     final commands = buildAudioSplitCommands(
       inputPath: inputPath,
       outputDirectory: outputDirectory,
@@ -1060,6 +1118,30 @@ class FfmpegMediaCutterService {
     bool streamCopy = false,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
+    return _splitAtCutsInternal(
+      inputPath: inputPath,
+      outputDirectory: outputDirectory,
+      baseName: baseName,
+      cutPointsSeconds: cutPointsSeconds,
+      totalDurationSeconds: totalDurationSeconds,
+      mediaType: mediaType,
+      streamCopy: streamCopy,
+      onProgress: onProgress,
+    );
+  }
+
+  Future<List<String>> _splitAtCutsInternal({
+    required String inputPath,
+    required String outputDirectory,
+    required String baseName,
+    required List<double> cutPointsSeconds,
+    required double totalDurationSeconds,
+    required CutterMediaType mediaType,
+    bool streamCopy = false,
+    void Function(double progress)? onProgress,
+  }) async {
+    if (_cancelled) throw const MediaCutterCancelledException();
     final commands = buildSplitAtCutsCommands(
       inputPath: inputPath,
       outputDirectory: outputDirectory,
@@ -1103,7 +1185,8 @@ class FfmpegMediaCutterService {
     }
 
     if (!copySucceeded) {
-      return splitAtCuts(
+      if (_cancelled) throw const MediaCutterCancelledException();
+      return _splitAtCutsInternal(
         inputPath: inputPath,
         outputDirectory: outputDirectory,
         baseName: baseName,
@@ -1130,8 +1213,10 @@ class FfmpegMediaCutterService {
     required double totalDurationSeconds,
     required CutterMediaType mediaType,
     bool hasAudio = true,
+    SmartCutVideoParams? preProbedParams,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
     _validateRange(startSeconds, endSeconds);
     if (mediaType == CutterMediaType.video && totalDurationSeconds > 0) {
       final result = await _smartCutService.smartCutSegments(
@@ -1140,6 +1225,7 @@ class FfmpegMediaCutterService {
         keptSegments: [(startSeconds, endSeconds)],
         totalDurationSeconds: totalDurationSeconds,
         hasAudio: hasAudio,
+        preProbedParams: preProbedParams,
         onProgress: onProgress,
       );
       if (result.succeeded) return result.outputPath;
@@ -1149,7 +1235,8 @@ class FfmpegMediaCutterService {
       );
     }
 
-    return cut(
+    if (_cancelled) throw const MediaCutterCancelledException();
+    return _cutInternal(
       inputPath: inputPath,
       outputPath: outputPath,
       startSeconds: startSeconds,
@@ -1172,8 +1259,10 @@ class FfmpegMediaCutterService {
     required double totalDurationSeconds,
     required CutterMediaType mediaType,
     bool hasAudio = true,
+    SmartCutVideoParams? preProbedParams,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
     _validateRange(removeStartSeconds, removeEndSeconds);
     if (totalDurationSeconds <= 0) {
       throw ArgumentError('totalDurationSeconds must be positive');
@@ -1196,6 +1285,7 @@ class FfmpegMediaCutterService {
         keptSegments: kept,
         totalDurationSeconds: totalDurationSeconds,
         hasAudio: hasAudio,
+        preProbedParams: preProbedParams,
         onProgress: onProgress,
       );
       if (result.succeeded) return result.outputPath;
@@ -1205,7 +1295,8 @@ class FfmpegMediaCutterService {
       );
     }
 
-    return cut(
+    if (_cancelled) throw const MediaCutterCancelledException();
+    return _cutInternal(
       inputPath: inputPath,
       outputPath: outputPath,
       startSeconds: removeStartSeconds,
@@ -1228,8 +1319,10 @@ class FfmpegMediaCutterService {
     required double totalDurationSeconds,
     required CutterMediaType mediaType,
     bool hasAudio = true,
+    SmartCutVideoParams? preProbedParams,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
     final kept = _keptSegments(ranges, totalDurationSeconds);
     if (kept.isEmpty) {
       throw ArgumentError('Cannot remove the entire media file');
@@ -1242,6 +1335,7 @@ class FfmpegMediaCutterService {
         keptSegments: kept,
         totalDurationSeconds: totalDurationSeconds,
         hasAudio: hasAudio,
+        preProbedParams: preProbedParams,
         onProgress: onProgress,
       );
       if (result.succeeded) return result.outputPath;
@@ -1251,7 +1345,8 @@ class FfmpegMediaCutterService {
       );
     }
 
-    return cutMultiRemove(
+    if (_cancelled) throw const MediaCutterCancelledException();
+    return _cutMultiRemoveInternal(
       inputPath: inputPath,
       outputPath: outputPath,
       ranges: ranges,
@@ -1274,8 +1369,10 @@ class FfmpegMediaCutterService {
     required double totalDurationSeconds,
     required CutterMediaType mediaType,
     bool hasAudio = true,
+    SmartCutVideoParams? preProbedParams,
     void Function(double progress)? onProgress,
   }) async {
+    _cancelled = false;
     buildSplitAtCutsCommands(
       inputPath: inputPath,
       outputDirectory: outputDirectory,
@@ -1293,6 +1390,7 @@ class FfmpegMediaCutterService {
         cutPointsSeconds: cutPointsSeconds,
         totalDurationSeconds: totalDurationSeconds,
         hasAudio: hasAudio,
+        preProbedParams: preProbedParams,
         onProgress: onProgress,
       );
       if (result.succeeded) return result.outputs!;
@@ -1302,7 +1400,8 @@ class FfmpegMediaCutterService {
       );
     }
 
-    return splitAtCuts(
+    if (_cancelled) throw const MediaCutterCancelledException();
+    return _splitAtCutsInternal(
       inputPath: inputPath,
       outputDirectory: outputDirectory,
       baseName: baseName,
@@ -1329,7 +1428,7 @@ class FfmpegMediaCutterService {
   /// [cancel] can stop the native process immediately instead of only
   /// noticing cancellation after encoding already completed.
   Future<FFmpegSession> _run(String command) async {
-    _cancelled = false;
+    if (_cancelled) throw const MediaCutterCancelledException();
     final completer = Completer<void>();
     final session = await FFmpegKit.executeAsync(
       command,
@@ -1342,6 +1441,7 @@ class FfmpegMediaCutterService {
     if (_cancelled) session.cancel().ignore();
     await completer.future;
     _activeSession = null;
+    if (_cancelled) throw const MediaCutterCancelledException();
     return session;
   }
 

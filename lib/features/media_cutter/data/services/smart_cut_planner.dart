@@ -894,17 +894,17 @@ class SmartCutPlanner {
     required SmartCutVideoParams params,
   }) {
     final frameDur = params.fps > 0 ? 1.0 / params.fps : 1.0 / 30.0;
-    final eps = math.min(0.001, frameDur * 0.25);
+    final halfFrame = frameDur * 0.5;
     final seekMargin = math.min(2.0, part.start);
     final seekStart = (part.start - seekMargin)
         .clamp(0.0, double.infinity)
         .toDouble();
-    final trimStart = (seekMargin - eps)
+    final trimStart = (seekMargin - halfFrame)
         .clamp(0.0, double.infinity)
         .toDouble();
     final trimEnd = math.max(
-      trimStart + frameDur * 0.5,
-      seekMargin + part.duration - eps,
+      trimStart + halfFrame,
+      seekMargin + part.duration - halfFrame,
     );
 
     return '-ss ${_fmt6(seekStart)} -i ${_q(inputPath)} -map 0:v:0 -an -sn -dn '

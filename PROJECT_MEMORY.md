@@ -642,3 +642,17 @@ Android يستخدم Java/Kotlin target 17، SDK versions موروثة من Flut
 - Limitations: host-side unit tests and static analysis only — FFmpeg/FFprobe execution and Android device playback/export behavior have NOT been executed locally yet.
 - Status: Implemented — awaiting review.
 - Next step: Run on-device Android verification (portrait rotated, non-zero `start_time`, HDR, H.264 closed/open GOP, B-frames, VFR, multi-range remove, cancel mid-probe/encode) and complete independent review.
+
+### 2026-11-21 — Smart Cut Final Polish (Isolate Part Counting + Half-Frame Trim Margin)
+
+- Scope: `lib/features/media_cutter/data/services/ffmpeg_smart_cut_service.dart`, `lib/features/media_cutter/data/services/smart_cut_planner.dart`, `test/smart_cut_planner_test.dart`.
+- Summary:
+  - Updated `_countWrittenPartPackets` in `FfmpegSmartCutService` to check `_cancelled` after `getOutput()`, enforce `SmartCutPlanner.maxProbeCsvBytes` safety cap (returning `-1` to trigger safe fallback), run `SmartCutPlanner.countCsvPackets` inside `Isolate.run(...)`, and re-check `_cancelled` before returning.
+  - Updated `SmartCutPlanner.buildReencodePartCommand` to use `halfFrame = frameDur * 0.5` for `trimStart = (seekMargin - halfFrame).clamp(0.0, double.infinity)` and `trimEnd = math.max(trimStart + halfFrame, seekMargin + part.duration - halfFrame)` while preserving `computeCopySeekStart` unchanged.
+  - Updated `test/smart_cut_planner_test.dart` assertions (`trim=start=1.983333:end=3.483333`) and added 2 new tests for `part.start == 0.0` clamping and single-frame `trimEnd > trimStart` handling (30 tests total in `smart_cut_planner_test.dart`).
+- Checks run:
+  - `flutter analyze --no-pub`: 0 errors, 0 issues in created/modified files (only 2 pre-existing unrelated `unused_import` warnings in `lib/features/video_enhancement/presentation/screens/{import_screen,preview_screen}.dart`).
+  - `flutter test --no-pub --reporter compact`: **431 passed** (47 in `test/media_cutter_command_test.dart` + 30 in `test/smart_cut_planner_test.dart` + remaining suite).
+- Limitations: host-side unit tests and static analysis only — FFmpeg/FFprobe execution and Android device playback/export behavior have NOT been executed locally yet.
+- Status: Implemented — awaiting review.
+- Next step: Run on-device Android verification and complete independent review.

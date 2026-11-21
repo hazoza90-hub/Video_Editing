@@ -922,7 +922,7 @@ packet,2.000000,1.933333,K__
       expect(
         reCmd,
         contains(
-          '-vf "trim=start=1.999000:end=3.499000,setpts=PTS-STARTPTS"',
+          '-vf "trim=start=1.983333:end=3.483333,setpts=PTS-STARTPTS"',
         ),
       );
       expect(reCmd, contains('-fps_mode passthrough'));
@@ -977,6 +977,70 @@ packet,2.000000,1.933333,K__
         10.0,
       );
       expect(kept, [(0.0, 2.0), (4.0, 7.0), (8.0, 10.0)]);
+    });
+
+    test('buildReencodePartCommand clamps trimStart to 0.000000 when part.start == 0.0', () {
+      final params = _validParams();
+      final zeroStartCmd = SmartCutPlanner.buildReencodePartCommand(
+        inputPath: 'C:/clips/src.mp4',
+        outputPath: 'C:/tmp/part_zero.ts',
+        part: const SmartCutPart(
+          kind: SmartCutPartKind.reencode,
+          start: 0.0,
+          end: 1.5,
+          frameCount: 45,
+        ),
+        params: params,
+      );
+      expect(zeroStartCmd, contains('-ss 0.000000'));
+      expect(
+        zeroStartCmd,
+        contains('trim=start=0.000000:end=1.483333,setpts=PTS-STARTPTS'),
+      );
+    });
+
+    test('buildReencodePartCommand preserves trimEnd > trimStart for single-frame parts', () {
+      final params = _validParams();
+      final singleFrameCmd = SmartCutPlanner.buildReencodePartCommand(
+        inputPath: 'C:/clips/src.mp4',
+        outputPath: 'C:/tmp/part_single.ts',
+        part: const SmartCutPart(
+          kind: SmartCutPartKind.reencode,
+          start: 2.5,
+          end: 2.5 + 1.0 / 30.0,
+          frameCount: 1,
+        ),
+        params: params,
+      );
+      expect(singleFrameCmd, contains('-frames:v 1'));
+      final trimMatch = RegExp(
+        r'trim=start=([0-9.]+):end=([0-9.]+)',
+      ).firstMatch(singleFrameCmd);
+      expect(trimMatch, isNotNull);
+      expect(
+        double.parse(trimMatch!.group(2)!),
+        greaterThan(double.parse(trimMatch.group(1)!)),
+      );
+
+      final singleZeroFrameCmd = SmartCutPlanner.buildReencodePartCommand(
+        inputPath: 'C:/clips/src.mp4',
+        outputPath: 'C:/tmp/part_single_zero.ts',
+        part: const SmartCutPart(
+          kind: SmartCutPartKind.reencode,
+          start: 0.0,
+          end: 1.0 / 30.0,
+          frameCount: 1,
+        ),
+        params: params,
+      );
+      final zeroTrimMatch = RegExp(
+        r'trim=start=([0-9.]+):end=([0-9.]+)',
+      ).firstMatch(singleZeroFrameCmd);
+      expect(zeroTrimMatch, isNotNull);
+      expect(
+        double.parse(zeroTrimMatch!.group(2)!),
+        greaterThan(double.parse(zeroTrimMatch.group(1)!)),
+      );
     });
   });
 }

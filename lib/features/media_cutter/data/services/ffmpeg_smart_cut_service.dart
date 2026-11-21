@@ -781,8 +781,21 @@ class FfmpegSmartCutService {
     final rc = await session.getReturnCode();
     if (!ReturnCode.isSuccess(rc)) return -1;
     final output = await session.getOutput();
+    if (_cancelled) throw const MediaCutterCancelledException();
     if (output == null || output.trim().isEmpty) return 0;
-    return SmartCutPlanner.countCsvPackets(output);
+    if (output.length > SmartCutPlanner.maxProbeCsvBytes) {
+      AppLogger().w(
+        'SmartCut part packet probe CSV exceeded '
+        '${SmartCutPlanner.maxProbeCsvBytes} bytes (${output.length}); '
+        'falling back cleanly',
+      );
+      return -1;
+    }
+    final count = await Isolate.run(
+      () => SmartCutPlanner.countCsvPackets(output),
+    );
+    if (_cancelled) throw const MediaCutterCancelledException();
+    return count;
   }
 
   Future<FFmpegSession> _runFfmpeg(
